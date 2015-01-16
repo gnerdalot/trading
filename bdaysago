@@ -1,0 +1,51 @@
+#!/usr/bin/perl
+
+# poc program - used to find business days back.
+# bugs - set for PT, might miss holidays. close enough for guesswork.
+
+unless (@ARGV == 3) {
+	printf "Usage: $0 <year> <month> <day>\n";
+	exit 2;
+}
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/lib/perl";
+
+use Date::Calendar;  # cpan
+use Date::Calendar::Profiles qw( $Profiles );  # would not cpan install, so just downloaded
+use DateTime;
+
+my $dt = DateTime->new(
+year      => 2015,
+month     => 1,
+day       => 2,
+hour      => 0,
+minute    => 15,
+time_zone => 'America/Los_Angeles',
+);
+
+$dt->subtract( days => 10 );
+# print $dt->ymd(' ');
+
+my @indate = (shift, shift, shift);
+
+# 0 1 2 3 4 5 6 7 8
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+$year += 1900;
+$mon++;
+
+my $cal = Date::Calendar->new( $Profiles->{US} ) or die "no calendar\n";
+
+my $days = $cal->delta_workdays(
+	$year, $mon, $mday,  # first date 
+	@indate,             # second date 
+	1,                   # include first date 
+	0,                   # exclude second date 
+);  
+
+# ago - thus the -1
+printf "%s\n", $days * -1 ;
+

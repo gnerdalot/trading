@@ -1,0 +1,545 @@
+#!/usr/bin/perl
+
+# equation generator for TC2000
+# http://www.worden.com/TeleChartHelp/Content/EasyScan/Formula_Codes.htm
+# http://forums.worden.com/default.aspx?g=posts&t=3181
+# 
+# neato command to start edit..
+#  history 30 | grep for | vi - +':f tc2000-formulae.pl'
+
+$|++;
+
+use warnings;
+use strict;
+use Data::Dumper;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use DateTime;
+
+use FindBin;
+use lib "$FindBin::Bin/lib/perl";
+
+# for calculating bdays
+use Date::Calendar;
+use Date::Calendar::Profiles qw( $Profiles );
+
+$Data::Dumper::Sortkeys = 1;
+$Data::Dumper::Indent = 1;
+
+# create pcf name
+my $PCF;
+map { $_ =~ $0 && next; $PCF .= $_ . ':'; } @ARGV;
+$PCF =~ s/[,:]$//;
+$PCF =~ s/[,:]/ /;
+
+# 2 steps for new sub
+# 1/2: Add sub and description
+# 2/2: Add subroutine
+my $tc2000_subs = {
+	daylight        => '20+ lows are above 10SMA - creating daylight between the candle and first MA line',
+	bowtie          => '10sma, 20ema, 30ema cross over, forming a bowtie (Dave Landry)',
+	pullback        => 'short run of lower highs and lower lows',
+	sandwich        => '10sma, 20ema, 30ema sandwiched together, perhaps mixed',
+	layered         => 'same as sandwich, but in order 10sma, 20ema, 30ema',
+	trending        => 'higher highs and higher lows OR lower highs and lower lows',
+	trendingmin     => 'min of close over long-term spans',
+	gaps            => 'look for gaps',
+	base            => 'keeps within a band for some days',
+	turtle          => 'http://www.bizmove.com/trade/binary-options-strategy.htm',
+	macdcrossup     => 'where macd crosses 0, up, 12-day EMA - 26-day EMA',
+	dns             => sprintf('dns system - Dans New system - combines 8 indicators into a ' .
+				      	'binary signal - http://www.tradeon.com/tradeon/tc2000/dns.html'),
+	dns2            => 'DNS, version 2: same web page towards end',
+	bullishrevbar   => 'higher close, lower low. http://www.tradingsetupsreview.com/10-price-action-bar-patterns-must-know/',
+	sma             => 'sma, width, and how far back. --ma 50 --end 100 what was the 50day SMA, 100 days ago',
+	ema             => 'ema, width, and how far back. --ma 72 --end 200 what was the 72day EMA, 200 days ago',
+	linreg          => 'http://forums.worden.com/default.aspx?g=posts&t=56359',
+	tripletap       => 'look for tripletaps',
+	rsi             => 'rsi cross',
+	help			=> 'help',
+};
+
+# create tc2000 prototypes, except those that start with '_'
+map { eval sprintf("sub %s;", $_); } grep(!/^_/, sort keys %{ $tc2000_subs });
+
+sub help;
+
+sub setvars;     # set the span - be it 10 meaning 1-10, or start&end..
+sub printit;
+sub busDaysAgo2Date;
+sub busDate2DaysAgo;
+sub daysAgo2Date;
+sub whoami;      # get sub name
+
+my @formula = ();
+
+my $cfg = {
+	'span'             => 1,
+	'tol'              => 0.005,
+	'step'             => 1,
+	'start'            => undef,    # start, end - counts backwards, 0 is today.
+	'end'              => 0,
+	'width'            => 1,
+	'ma'               => 10,
+	'value'            => 70,
+	'verbose'          => 0,
+	'direction'        => 'up',
+	'_dir'             => '>',
+	'formula'          => \@formula,
+	'defs'             => { 
+		'direction'    => { up => '>', down => '<', sideways => '=', }
+	},
+};
+
+my $err = {
+	help => sprintf('tc2000-formulae.pl <sub> --span <int> --tol <float> --start <int> --end <int>'),
+	examples => [
+		'./tc2000-formulae.pl trending --direction up --span 5 -v',
+		'./tc2000-formulae.pl trendingmin --direction down --span 120 --step 20',
+		'./tc2000-formulae.pl trendingmin --direction up --span 60 --step 15',
+		'./tc2000-formulae.pl base --start 200 --span 4',
+		'./tc2000-formulae.pl base --start 100 --span 4 --tol .07',
+		'./tc2000-formulae.pl dns --span 1 --start 100',
+	],
+};
+
+############## start main #####################################################
+
+# first arg is the sub to use
+(@ARGV) || help;
+(defined $main::{$ARGV[0]}) || die "Function $ARGV[0] DNE\n";
+my $func = shift;
+
+
+# get command line options
+my $ret = GetOptions(
+	'i|step|inc=s'         => \$cfg->{step},
+	'd|dir|direction=s'    => \$cfg->{direction},
+	'S|span=s'             => \$cfg->{span},
+	't|tol=s'              => \$cfg->{tol},
+	'V|value=s'            => \$cfg->{value},
+	'ma=s'                 => \$cfg->{ma},
+	'w|width=s'            => \$cfg->{width},
+	's|start=s'            => \$cfg->{start},
+	'v'                    => \$cfg->{verbose},
+	'help|h'               => \&help,
+);
+
+($ret == 0) && warn $!;
+($ret == 0) && help;
+
+# set variables
+setvars;
+($cfg->{verbose}) && printf STDERR "function: $func\nvars and settings: \n%s\n", Dumper $cfg;
+
+# build and eval the function call..
+# plus some useful date info
+# can verify at http://www.timeanddate.com/date/weekdayadd.html
+my $call = sprintf(
+		"printit(%s(start => %s, end => %s, step => %s, tol => %s, span => %s, dir => '%s', ma => %s, value => %s))", 
+	$func, $cfg->{start}, $cfg->{end}, $cfg->{step}, $cfg->{tol}, $cfg->{span}, $cfg->{_dir}, $cfg->{ma}, $cfg->{value});
+
+# + 1 on the end date because tc2000 notation X.3 means 3 days before current day.
+# fencepost
+printf STDERR "# Function call: $call\n# Business Dates  %s - %s\n# TC2000 PCF Name:\n$PCF\n\n", 
+	busDaysAgo2Date(ago => $cfg->{end} + 1), busDaysAgo2Date(ago => $cfg->{start});
+eval $call;
+exit $?;
+
+############## end main #######################################################
+
+
+##############  subs   ########################################################
+
+sub help {
+	printf STDERR "Usage:\n%s\nOptions:\n%s", $err->{help}, Dumper $cfg;
+	printf "\nStart/End/Span: counts backwards from today (zero).\n--start 0 --end 200 means start today, go 200 days back\n";
+	printf "\nSubs:\n";
+	map { printf("%s %s\n", sprintf("%-14s:", $_), $tc2000_subs->{$_}); } sort keys %{ $tc2000_subs };
+	printf "\n\n";
+	exit;
+}
+
+sub setvars {
+	my $me = whoami();
+
+	$cfg->{_direction}  =  $cfg->{defs}->{direction}->{ $cfg->{direction} };
+	$cfg->{_dir}        =  $cfg->{_direction};
+	$cfg->{tol}         = ($cfg->{tol} =~ /\d/) ? $cfg->{tol} : 0.005;
+	$cfg->{start}       = (defined $cfg->{start} && $cfg->{start} =~ /\d/) ? $cfg->{start} : 1;
+	$cfg->{end}         =  $cfg->{start} + $cfg->{span};
+	$err->{span}        = sprintf("Span is zero. Derp. set either span or start&end. start=%s, end=%s\n", $cfg->{start}, $cfg->{end});
+
+	printf STDERR "# start:%s  span:%s  end:%s\n", $cfg->{start}, $cfg->{span}, $cfg->{end};
+
+	($cfg->{span} =~ /\d/) ? return $cfg->{span} : die "$err->{span}\n";
+}
+	 
+sub printit {
+	my $me = whoami();
+	printf "(\n%s\n)\n", shift;
+}
+
+
+# return current sub name
+sub whoami {
+	return (caller(1))[3]
+}
+
+
+# converts days ago to date....
+sub daysAgo2Date {
+	my $me = whoami();
+	my %params = @_;
+
+	my ($s,$M,$H,$d,$m,$y,$wday,$yday,$isdst) = localtime(time);
+
+	$params{y}    ||= $y + 1900;
+	$params{m}    ||= $m += 1;
+	$params{d}    ||= $d;
+	$params{H}    ||= $H;
+	$params{M}    ||= $M;
+	$params{ago} = ($params{ago} =~ /\d/) ? $params{ago} : 0;
+
+	my $dt = DateTime->new(
+		year      => $params{y},
+		month     => $params{m},
+		day       => $params{d},
+		hour      => $params{H},
+		minute    => $params{M},
+		time_zone => 'America/Los_Angeles',
+	);
+ 
+	$dt->subtract( days => $params{ago} ); 
+	($cfg->{verbose}) && printf STDERR "ago: $params{ago}, date: %s\n", $dt->ymd(' ');
+
+	return $dt->ymd(' ');
+
+}
+
+# pass in b days ago...
+# start with days ago todate, iterate until busDate2DaysAgo returns same as passed in ago
+# including holidays
+sub busDaysAgo2Date {
+	my $me = whoami();
+	my %params = @_;
+
+	for (my $i = $params{ago}; $i < $params{ago}*7/5+50; $i++) {
+		($cfg->{verbose}) && printf STDERR "ago: %s, i = $i\n", $params{ago};
+
+		# we found the date that was N business days ago
+		if ($params{ago} == busDate2DaysAgo(date => daysAgo2Date(ago => $i)))
+		{
+			$cfg->{bcaldays} = $i;
+			$cfg->{bdate} = daysAgo2Date(ago => $cfg->{bcaldays});
+			last;
+		}
+
+	}
+	return daysAgo2Date(ago => $cfg->{bcaldays});
+}
+
+# converts date to business days ago, but not the reverse..
+sub busDate2DaysAgo {
+	my %params = @_;
+
+	# 0 1 2 3 4 5 6 7 8
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	$year += 1900;
+	$mon++;
+	my ($Y, $m, $d) = split /\D+/, $params{date};
+
+	my $cal = Date::Calendar->new( $Profiles->{US} ) or die "no calendar\n";
+
+	my $days = $cal->delta_workdays(
+		$year, $mon, $mday,    # first date, default today
+		$Y, $m, $d,            # second date 
+		1,                     # include first date 
+		1,                     # exclude second date 
+	);  
+
+	return abs($days);
+
+}
+
+
+
+# Dave Landry - Daylight
+sub daylight {
+	my $me = whoami();
+	my %params = @_;
+
+	push @formula, sprintf "(L > (AvgC10))";
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		push @formula, sprintf "(L${i} > (AvgC10.${i}))";
+	}
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+
+sub bullishrevbar {
+	my $me = whoami();
+	my %params = @_;
+
+	push @formula, sprintf "(C.%s > C.%s) AND (C.%s < C.%s) AND (L.%s > L.%s)", 
+		$params{start} + 2, $params{start} + 1, $params{start} + 1, $params{start}, $params{start} + 1, $params{start};
+
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+
+sub sma {
+	my $me = whoami();
+	my %params = @_;
+
+	push @formula, sprintf "(C.%s %s AvgC%s.%s)", $params{end}, $params{dir}, $params{ma}, $params{end};
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+
+sub ema {
+	my $me = whoami();
+	my %params = @_;
+
+	push @formula, sprintf "(C.%s %s XAvgC%s.%s)", $params{end}, $params{dir}, $params{ma}, $params{end};
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+sub linreg {
+	my $me = whoami();
+	my %params = @_;
+
+
+	push @formula, sprintf "(SGN((2 * %s - 1) * C - 3 * (%s - 1) * AVGC%s.1 + (%s - 2) * C%s))", 
+		$params{span}, $params{span}, $params{span}, $params{span}, $params{span};
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+# this needs work...
+sub pullback {
+	my $me = whoami();
+	my %params = @_;
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		push @formula, sprintf "( (H.%s < H.%s) AND (V.%s < V.%s) )", $i, $params{end} + 1, $i, $params{end} + 1;
+	}
+
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+# Kunal Desai - sandwich 
+sub sandwich {
+	my $me = whoami();
+	my %params = @_;
+
+	push @formula, sprintf "(\n(( (abs(AvgC10 - XAvgC20)/C.10) < $params{tol}) AND ((abs(XavgC20 - XavgC30)/C.20) < $params{tol}) )" . 
+			"AND ( abs(AvgC10 - C) < $params{tol} )";
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		push @formula, sprintf "(" .
+			"( (abs(AvgC10.${i} - XAvgC20.${i})/C.10.${i}) < $params{tol} ) AND " .
+			"( (abs(XAvgC20.${i} - XAvgC30.${i})/C.20.${i}) < $params{tol} ) AND " .
+			"( abs(AvgC10.${i} - C.${i}) < $params{tol} )" .
+			")";
+	} 
+	return sprintf "%s", join " OR \n", @formula;
+	
+}
+
+sub layered {
+	my $me = whoami();
+	my %params = @_;
+
+	push @formula, sprintf "( (AvgC10 %s XAvgC20) AND (XAvgC20 %s XAvgC30) )", $params{dir}, $params{dir};
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		push @formula, sprintf "( (AvgC10.${i} %s XAvgC20.${i}) AND (XAvgC20.${i} %s XAvgC30.${i}) )", 
+			$params{dir}, $params{dir};
+	} 
+	return sprintf "%s", join " AND \n", @formula;
+	
+}
+
+
+# 30 > 20 > 10  X  10 > 20 > 30
+# or inverse. strict. does not allow swapping of 20/30
+sub bowtie {
+	my $me = whoami();
+	my %params = @_;
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		my $left  = $i - $cfg->{width};
+		my $right = $i + $cfg->{width};
+		my $dir   = $i + $cfg->{width};
+		push @formula, sprintf 
+			"( ( (AvgC10.$left %s XAvgC20.$left) AND (XAvgC20.$left %s XAvgC30.$left) ) AND " .
+			"( (AvgC10.$right %s XAvgC20.$right) AND (XAvgC20.$right %s XAvgC30.$right) ) )",
+			$params{dir}, $params{dir}, $params{dir}, $params{dir};
+	} 
+	return sprintf "%s", join "\n OR \n", @formula;
+	
+}
+
+
+# higher highs & higher lows OR lower highs and lower lows
+# strict - see trending min for looser scan formula
+sub trending {
+	my $me = whoami();
+	my %params = @_;
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		($cfg->{verbose}) && printf STDERR "$me $i\n";
+		push @formula, sprintf "(H.%s %s H.%s)", $i + 1, $params{dir}, $i;
+		push @formula, sprintf "(L.%s %s L.%s)", $i + 1, $params{dir}, $i;
+	}
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+
+# look for higher min within timeframes. allows for 'big picture' ups/downs
+sub trendingmin {
+	my %params = @_;
+	my $me = whoami();
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		($cfg->{verbose}) && printf STDERR "$me $i\n";
+		push @formula, sprintf "(MinC%s %s MinC%s)", $i, $params{dir}, $i + $params{step};
+	}
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+sub tripletap {
+	my %params = @_;
+	my $me = whoami();
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		($cfg->{verbose}) && printf STDERR "$me $i\n";
+		push @formula, sprintf "(abs(MaxC%s.%s/MaxC%s.%s - 1) < %s)", 
+			$params{step}, $i, $params{step}, $i + $params{step}, $params{tol};
+	}
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+
+sub rsi {
+	my %params = @_;
+	my $me = whoami();
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+
+		($cfg->{verbose}) && printf STDERR "$me $i\n";
+
+		my $str = sprintf "(rsi%s.%s FIRST %s) and (rsi%s.%s SECOND %s)", 
+			$params{ma}, $i + $params{step}, $params{value}, $params{ma}, $i, $params{value};
+
+		if ($cfg->{direction} =~ /up/) {
+			$str =~ s/FIRST/</; $str =~ s/SECOND/>/;
+		}
+		else {
+			$str =~ s/FIRST/>/; $str =~ s/SECOND/</;
+		}
+		push @formula, $str;
+	}
+	return sprintf "%s", join " OR \n", @formula;
+}
+
+# gaps - low - next day high 
+sub gaps {
+	my $me = whoami();
+	my %params = @_;
+
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		($cfg->{verbose}) && printf STDERR "$me $i\n";
+		if ($cfg->{direction} =~ /up/) {
+			push @formula, sprintf "( (L.%s - H.%s) > H.%s * %s)", $i, $i + 1, $i + 1, $params{tol};
+		}
+		else {
+			push @formula, sprintf "( (L.%s - H.%s) > H.%s * %s)", $i + 1, $i, $i, $params{tol};
+		}
+	}
+	return sprintf "%s", join " OR \n", @formula;
+}
+
+# basing out - 
+sub base {
+	my $me = whoami();
+	my %params = @_;
+
+	push @formula, sprintf "(MaxH%s.%s - MinL%s.%s) <= (MaxL%s.%s * %s)",
+		$params{span}, $params{start}, $params{span}, $params{end}, $params{span}, $params{start}, $params{tol};
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+sub macdcrossup {
+	my $me = whoami();
+	my %params = @_;
+	for (my $i = $params{start}; $i <= $params{end}; $i += $params{step}) {
+		($cfg->{verbose}) && printf STDERR "$me $i\n";
+		push @formula, sprintf "( ((XAvgC12.%s - XAvgC26.%s) - (XAvgC12.%s - XAvgC26.%s) >= %s) AND ((XAvgC12.%s - XAvgC26.%s) <= 0) AND ((XAvgC12.%s - XAvgC26.%s) >= 0) )", 
+			$i + 1, $i + 1, $i, $i, $params{tol}, $i + 1, $i + 1, $i, $i;
+	}
+	return sprintf "%s", join " OR \n", @formula;
+}
+
+
+sub dns {
+	my $me = whoami();
+	my %params = @_;
+	my $s = $params{start};
+	my $ind = {
+		pcf1 => sprintf("(AvgC5.$s > AvgC13.$s)"),
+		pcf2 => sprintf("(AvgC13.$s > AvgC40.$s)"),
+		pcf3 => sprintf("((AVGC8.$s - AVGC17.$s) > (AVG(AVGC8.$s,9) - AVG(AVGC17.$s,9)))"),
+		pcf4 => sprintf("((AVGC55.$s - AVGC55.%s) > 0)", 15 + $s),
+		pcf5 => sprintf("(((C.$s / C13.$s)/C13.$s * 100) > 0)", 13 + $s),
+		pcf6 => sprintf("(V.$s > AVGV120.$s)"),
+		pcf7 => sprintf("( (AVGV126.$s > 1000) AND (C.$s > (MAXC252.%s) * .85) AND (V.$s >= AVGV63.$s) AND (C.$s > (MINC5.$s) * 1.05) )", 1 + $s),
+		_note0 => 'OBV > 40 OBV sma - requires visual confirmation',
+		_note1 => 'pcf7 is Richards buy buy buy scan: http://www.siliconinvestor.com/subject.aspx?subjectid=9027',
+	};
+
+	push @formula, map { sprintf "%s", $ind->{$_} } grep(!/^_/, sort keys %{ $ind });
+	return sprintf "%s", join " AND \n", @formula;
+
+}
+
+sub dns2 {
+	# dns = dans new system
+	my $me = whoami();
+	my %params = @_;
+	my $s = $params{start};
+	my $ind = {
+		pcf1 => sprintf("( (AvgC34.$s > AvgC55.$s) AND (AvgC55.$s > AvgC89.$s) )"),
+		pcf2 => sprintf("(L.$s > AvgC34.$s)"),
+		pcf3 => sprintf("(AVGC13.$s > AVGC34.$s)"),
+		pcf4 => sprintf("(AVGC5.$s > AVGC13.$s)"),
+		pcf5 => sprintf("(AVGC13.$s - AVGC13.%s > 0)", $s + 5),
+		pcf6 => sprintf("(AVGC55.$s - AVGC55.%s > 0)", $s + 15),
+		pcf7 => sprintf("(AVGC89.$s - AVGC89.%s > 0)", $s + 27),
+		pcf8 => sprintf("( (C.$s / C10.$s) > 1)"),
+		pcf9 => sprintf("( (V.$s > AVGV120.$s) AND (V.$s > 9000) )" ),
+		_note1 => 'pcf7 is Richards buy buy buy scan: http://www.siliconinvestor.com/subject.aspx?subjectid=9027',
+	};
+
+	push @formula, map { sprintf "%s", $ind->{$_} } grep(!/^_/, sort keys %{ $ind });
+	return sprintf "%s", join " AND \n", @formula;
+
+}
+
+__END__
+# turtle
+# http://www.bizmove.com/trade/binary-options-strategy.htm
+sub turtle {
+	my $me = whoami();
+	my %params = @_;
+
+	if ($cfg->{direction} =~ /up/) {
+		push @formula, sprintf "(MaxH20 < H)";
+	}
+	else {
+		push @formula, sprintf "(L < MinL20)";
+	}
+	return sprintf "%s", join " AND \n", @formula;
+}
+
+
+# vim: noai:ts=4:sw=4
+
